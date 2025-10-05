@@ -69,6 +69,7 @@ async function downloadToFile(url, destPath) {
  * Run bbc/audiowaveform to create a JSON file with peaks.
  * @returns {Promise<string>} path to raw JSON file produced by audiowaveform
  */
+// replace your runAudiowaveform() with this version
 function runAudiowaveform(inputFile, outJsonFile, pixels = 4000) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -84,12 +85,16 @@ function runAudiowaveform(inputFile, outJsonFile, pixels = 4000) {
     let stderr = '';
     proc.stderr.on('data', d => { stderr += d.toString(); });
 
+    // ⬇️ this line is the important new bit
+    proc.on('error', (err) => reject(new Error(`audiowaveform spawn failed: ${err.message}. Is it installed in the image?`)));
+
     proc.on('close', (code) => {
       if (code === 0) return resolve(outJsonFile);
       reject(new Error(`audiowaveform exited ${code}: ${stderr.trim()}`));
     });
   });
 }
+
 
 /**
  * Convert audiowaveform 8-bit JSON -> normalized float array [-1..1]
