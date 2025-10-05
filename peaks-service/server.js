@@ -1,4 +1,9 @@
-// Minimal peaks microservice for Railway + Bunny Storage (FFmpeg version)
+// server.js
+// Minimal peaks microservice for Railway + Bunny Storage
+// - Downloads an MP3 from your Bunny CDN (sending a Referer header so hotlink
+//   protection allows it)
+// - Generates a WaveSurfer-compatible peaks JSON using bbc/audiowaveform
+// - Uploads the JSON to Bunny Storage and returns the public CDN URL
 
 import express from 'express';
 import cors from 'cors';
@@ -11,6 +16,7 @@ import crypto from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
+// ---------- ENV ----------
 const PORT = process.env.PORT || 3000;
 
 // Bunny config (required)
@@ -18,135 +24,110 @@ const BUNNY_STORAGE_NAME = process.env.BUNNY_STORAGE_NAME; // e.g. "markcutz"
 const BUNNY_FOLDER       = process.env.BUNNY_FOLDER || 'waveforms';
 const BUNNY_ACCESS_KEY   = process.env.BUNNY_ACCESS_KEY;   // Storage Password
 const CDN_HOST           = process.env.CDN_HOST;           // e.g. "markcutz-mixes.b-cdn.net"
+
+// If your zone is regional, you can override with e.g. 'la.storage.bunnycdn.com'
 const BUNNY_STORAGE_HOST = process.env.BUNNY_STORAGE_HOST || 'storage.bunnycdn.com';
 
+// 👇 NEW: send this Referer header when downloading from the Pull Zone
+const REF = process.env.REFERER_URL || 'https://www.markcutz.com/';
+
+// ---------- APP ----------
 const app = express();
-app.use(cors());
+app.use(cors()); // admin page calls from Wix
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/', (_req, res) => res.type('text').send('peaks-service up'));
 app.get('/health', (_req, res) => res.type('text').send('ok'));
 
-function reqEnv(name){
+// ---------- Helpers ----------
+function reqEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing required env: ${name}`);
   return v;
 }
-function tmpFile(ext = ''){
+
+function tmpFile(ext = '') {
   const id = crypto.randomBytes(8).toString('hex');
   return path.join(os.tmpdir(), `${id}${ext}`);
 }
-function slugify(s){
-  return String(s).trim().toLowerCase()
+
+function slugify(s) {
+  return String(s)
+    .trim()
+    .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)+/g, '') || `mix-${Date.now()}`;
+    .replace(/(^-|-$)+/g, '')
+    || `mix-${Date.now()}`;
 }
-async function downloadToFile(url, destPath){
-  const res = await fetch(url);
-  if (!res.ok || !res.body) throw new Error(`Download failed ${res.status} ${res.statusText}`);
+
+// 👇 UPDATED: include a Referer header so Bunny hotlink protection allows the fetch
+async function downloadToFile(url, destPath) {
+  const res = await fetch(url, {
+    headers: {
+      'Referer': REF,
+      'User-Agent': 'peaks-service/1.0 (+railway)'
+    }
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`Download failed ${res.status} ${res.statusText}`);
+  }
   const readable = Readable.fromWeb(res.body);
   await pipeline(readable, fs.createWriteStream(destPath));
   return destPath;
 }
 
-function ffprobeDurationSeconds(inputFile){
-  return new Promise((resolve) => {
+/**
+ * Run bbc/audiowaveform to create a JSON file with peaks.
+ * @returns {Promise<string>} path to raw JSON file produced by audiowaveform
+ */
+function runAudiowaveform(inputFile, outJsonFile, pixels = 4000) {
+  return new Promise((resolve, reject) => {
     const args = [
-      '-v','error',
-      '-show_entries','format=duration',
-      '-of','default=nw=1:nk=1',
-      inputFile
+      '-i', inputFile,
+      '--output-format', 'json',
+      '-o', outJsonFile,
+      '--pixels', String(pixels),
+      '--bits', '8',
+      '--no-progress',
     ];
-    const p = spawn('ffprobe', args, { stdio: ['ignore','pipe','ignore'] });
-    let out = '';
-    p.stdout.on('data', d => { out += d.toString(); });
-    p.on('close', () => {
-      const secs = parseFloat(out.trim());
-      resolve(isFinite(secs) ? secs : null);
+    const proc = spawn('audiowaveform', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+
+    proc.on('error', (err) =>
+      reject(new Error(`audiowaveform spawn failed: ${err.message}. Is it installed?`))
+    );
+
+    proc.on('close', (code) => {
+      if (code === 0) return resolve(outJsonFile);
+      reject(new Error(`audiowaveform exited ${code}: ${stderr.trim()}`));
     });
-    p.on('error', () => resolve(null));
   });
 }
 
 /**
- * Stream-decode to mono float32 via ffmpeg and build a peaks array of length ~pixels
- * Returns an array of numbers in [0..1]
+ * Convert audiowaveform 8-bit JSON -> normalized float array [-1..1]
+ * Output is a plain array so WaveSurfer can use it directly.
  */
-async function buildPeaksWithFfmpeg(inputFile, pixels = 4000, sampleRate = 11025){
-  const duration = await ffprobeDurationSeconds(inputFile);
-  const rate = sampleRate;
-
-  // If we know the duration, we can compute precise bin size
-  const estimatedTotalSamples = duration ? Math.max(1, Math.floor(duration * rate)) : null;
-  const binSize = estimatedTotalSamples
-    ? Math.max(1, Math.floor(estimatedTotalSamples / pixels))
-    : Math.max(1, Math.floor(rate * 0.05)); // fallback ~50ms windows
-
-  return await new Promise((resolve, reject) => {
-    const args = [
-      '-v','error',
-      '-i', inputFile,
-      '-ac','1',
-      '-filter:a', `aresample=${rate}`,
-      '-f','f32le',
-      'pipe:1'
-    ];
-    const ff = spawn('ffmpeg', args, { stdio: ['ignore','pipe','pipe'] });
-
-    let peaks = [];
-    let samplesInBin = 0;
-    let curMax = 0;
-
-    ff.stdout.on('data', (chunk) => {
-      // chunk is raw f32le PCM
-      const count = Math.floor(chunk.length / 4);
-      // Use a Float32Array view without copying
-      const floats = new Float32Array(chunk.buffer, chunk.byteOffset, count);
-
-      for (let i = 0; i < floats.length; i++) {
-        const val = Math.abs(floats[i]);           // magnitude only (0..1)
-        if (val > curMax) curMax = val;
-        samplesInBin++;
-        if (samplesInBin >= binSize) {
-          peaks.push(Math.max(0, Math.min(1, curMax)));
-          samplesInBin = 0;
-          curMax = 0;
-        }
-      }
-    });
-
-    let stderr = '';
-    ff.stderr.on('data', d => { stderr += d.toString(); });
-
-    ff.on('close', (code) => {
-      if (samplesInBin > 0) {
-        peaks.push(Math.max(0, Math.min(1, curMax)));
-      }
-      if (code !== 0 && peaks.length === 0) {
-        return reject(new Error(`ffmpeg exited ${code}: ${stderr.trim()}`));
-      }
-
-      // Normalize length to ~pixels (down/up sample if needed)
-      if (peaks.length > pixels) {
-        const ratio = peaks.length / pixels;
-        const down = new Array(pixels);
-        for (let i = 0; i < pixels; i++) {
-          down[i] = peaks[Math.floor(i * ratio)];
-        }
-        peaks = down;
-      } else if (peaks.length < Math.max(16, Math.floor(pixels * 0.5))) {
-        // if very short, pad (rare for long mixes)
-        while (peaks.length < pixels) peaks.push(peaks[peaks.length - 1] || 0);
-      }
-
-      resolve(peaks);
-    });
-
-    ff.on('error', (err) => reject(new Error(`ffmpeg spawn failed: ${err.message}`)));
+async function convertRawJsonToPeaks(rawJsonPath, outPeaksPath) {
+  const raw = JSON.parse(await fsp.readFile(rawJsonPath, 'utf8'));
+  const data = raw.data || raw.samples || [];
+  const peaks = Array.from(data, (v) => {
+    const n = Number(v);
+    const clamped = Math.max(0, Math.min(255, isFinite(n) ? n : 128));
+    return (clamped - 128) / 128; // -> [-1..~0.99]
   });
+
+  await fsp.writeFile(outPeaksPath, JSON.stringify(peaks));
+  return outPeaksPath;
 }
 
-async function uploadToBunnyStorage(filename, buffer, contentType = 'application/json'){
+/**
+ * Upload a file Buffer to Bunny Storage using the HTTP API (AccessKey header)
+ * Returns the *public CDN URL*.
+ */
+async function uploadToBunnyStorage(filename, buffer, contentType = 'application/json') {
   const zone  = reqEnv('BUNNY_STORAGE_NAME');
   const host  = BUNNY_STORAGE_HOST;
   const url   = `https://${host}/${zone}/${BUNNY_FOLDER}/${filename}`;
@@ -164,15 +145,23 @@ async function uploadToBunnyStorage(filename, buffer, contentType = 'application
     const text = await res.text().catch(() => '');
     throw new Error(`Bunny upload failed ${res.status}: ${text}`);
   }
-  return `https://${reqEnv('CDN_HOST')}/${BUNNY_FOLDER}/${filename}`;
+
+  const cdn = reqEnv('CDN_HOST');
+  return `https://${cdn}/${BUNNY_FOLDER}/${filename}`;
 }
 
+// ---------- Routes ----------
+/**
+ * POST /peaks
+ * body: { sourceUrl: string, outName?: string, pixels?: number }
+ * returns: { ok: true, cdnUrl: string, count: number, ms: number }
+ */
 app.post('/peaks', async (req, res) => {
   const t0 = Date.now();
-  let tmpIn;
+  let tmpIn, tmpRaw, tmpPeaks;
 
   try {
-    // validate env early
+    // Validate envs early
     reqEnv('BUNNY_STORAGE_NAME');
     reqEnv('BUNNY_ACCESS_KEY');
     reqEnv('CDN_HOST');
@@ -183,31 +172,43 @@ app.post('/peaks', async (req, res) => {
     }
     const PIXELS = Math.max(1000, Math.min(16000, Number(pixels) || 4000));
 
-    tmpIn = tmpFile('.mp3');
+    // Temp files
+    tmpIn    = tmpFile('.mp3');
+    tmpRaw   = tmpFile('.raw.json');
+    tmpPeaks = tmpFile('.peaks.json');
+
+    // 1) Download MP3 (with Referer header)
     await downloadToFile(sourceUrl, tmpIn);
 
-    const peaks = await buildPeaksWithFfmpeg(tmpIn, PIXELS, 11025);
+    // 2) Generate raw waveform JSON
+    await runAudiowaveform(tmpIn, tmpRaw, PIXELS);
 
+    // 3) Convert to normalized peaks array
+    await convertRawJsonToPeaks(tmpRaw, tmpPeaks);
+
+    // 4) Upload peaks JSON to Bunny
     const base = outName ? slugify(outName) : slugify(path.parse(sourceUrl).name);
     const filename = `${base}.peaks.json`;
-    const buf = Buffer.from(JSON.stringify(peaks));
-    const cdnUrl = await uploadToBunnyStorage(filename, buf, 'application/json');
+    const buffer   = await fsp.readFile(tmpPeaks);
+    const cdnUrl   = await uploadToBunnyStorage(filename, buffer, 'application/json');
 
-    res.json({
-      ok: true,
-      cdnUrl,
-      count: peaks.length,
-      ms: Date.now() - t0
-    });
+    const elapsedMs = Date.now() - t0;
+    const count = JSON.parse(buffer.toString()).length;
+
+    return res.json({ ok: true, cdnUrl, count, ms: elapsedMs });
   } catch (err) {
     console.error('[peaks] error:', err);
-    res.status(500).json({ status: 'error', message: String(err?.message || err) });
+    return res.status(500).json({ error: String(err?.message || err) });
   } finally {
-    if (tmpIn) fsp.unlink(tmpIn).catch(()=>{});
+    for (const f of [tmpIn, tmpRaw, tmpPeaks]) {
+      if (f) fsp.unlink(f).catch(() => {});
+    }
   }
 });
 
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`peaks-service listening on :${PORT}`);
   console.log(`Using Bunny host: ${BUNNY_STORAGE_HOST}`);
+  console.log(`Download Referer: ${REF}`);
 });
