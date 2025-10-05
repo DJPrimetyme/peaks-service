@@ -1,4 +1,4 @@
-# peaks-service
+
 
 A tiny service that turns an MP3 URL into a WaveSurfer-compatible peaks JSON,
 and uploads that JSON straight to Bunny Storage (no Transloadit, no SFTP).
