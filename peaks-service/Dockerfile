@@ -1,30 +1,20 @@
-# Stable Debian base + Node 20
-FROM node:20-bookworm
+# Small Debian image with Node 20 + ffmpeg available via apt
+FROM node:20-bookworm-slim
 
 ENV NODE_ENV=production
-ENV PORT=3000
 
-# Minimal tools
+# Install ffmpeg and a couple tiny utilities, then clean the cache
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- Install audiowaveform (prebuilt static binary) ----
-# If a newer version exists, you can bump AW_VER and the URL.
-ARG AW_VER=1.9.0
-RUN set -eux; \
-  curl -L -o /tmp/aw.tar.gz \
-    https://github.com/bbc/audiowaveform/releases/download/${AW_VER}/audiowaveform-${AW_VER}-Linux-x86_64.tar.gz; \
-  tar -xzf /tmp/aw.tar.gz -C /tmp; \
-  mv /tmp/audiowaveform-*/audiowaveform /usr/local/bin/audiowaveform; \
-  chmod +x /usr/local/bin/audiowaveform; \
-  rm -rf /tmp/audiowaveform-* /tmp/aw.tar.gz; \
-  audiowaveform -v || true
-
-# App install
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci --omit=dev || npm i --omit=dev
+
+# Install deps
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev || npm install --omit=dev
+
+# App code
 COPY . .
 
 EXPOSE 3000
