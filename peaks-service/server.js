@@ -1,292 +1,170 @@
-// server.js — peaks microservice using ffmpeg (no audiowaveform dependency)
+// Minimal peaks microservice with Bunny CDN -> Storage fallback
+// Works on Railway. Generates WaveSurfer-compatible peaks JSON.
 
-import express from 'express';
-import cors from 'cors';
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
-import path from 'node:path';
-import os from 'node:os';
-import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { pipeline } from 'node:stream/promises';
-import { Readable } from 'node:stream';
+import express from "express";
+import cors from "cors";
+import { spawn } from "child_process";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
 
-// ---------- ENV ----------
 const PORT = process.env.PORT || 3000;
 
-// Bunny Storage config
-const BUNNY_STORAGE_NAME = process.env.BUNNY_STORAGE_NAME; // e.g. "markcutz"
-const BUNNY_FOLDER       = process.env.BUNNY_FOLDER || 'waveforms';
-const BUNNY_ACCESS_KEY   = process.env.BUNNY_ACCESS_KEY;   // Storage "Password"
-const CDN_HOST           = process.env.CDN_HOST;           // e.g. "markcutz-mixes.b-cdn.net"
+// ---- Required ENV ----
+const CDN_HOST            = envReq("CDN_HOST");            // e.g. "markcutz-mixes.b-cdn.net"
+const BUNNY_STORAGE_NAME  = envReq("BUNNY_STORAGE_NAME");  // e.g. "markcutz"
+const BUNNY_ACCESS_KEY    = envReq("BUNNY_ACCESS_KEY");    // Storage Password
+const BUNNY_FOLDER        = process.env.BUNNY_FOLDER || "waveforms";
+const BUNNY_STORAGE_HOST  = process.env.BUNNY_STORAGE_HOST || "storage.bunnycdn.com"; // or region host
+const ALLOWED_REFERRER    = (process.env.ALLOWED_REFERRER || "").trim().toLowerCase(); // e.g. "www.markcutz.com" (no scheme)
+const ALT_CDN_HOST        = (process.env.ALT_CDN_HOST || "").trim(); // optional second pull zone
 
-// Use regional host if you want (fallback to global)
-const BUNNY_STORAGE_HOST = process.env.BUNNY_STORAGE_HOST || 'storage.bunnycdn.com';
+function envReq(k){ const v = process.env[k]; if(!v) throw new Error(`Missing env ${k}`); return v; }
 
-// Optional: used as Referer when downloading from Bunny CDN (to satisfy Allowed Referrers)
-const ALLOWED_REFERRER   = process.env.ALLOWED_REFERRER || 'https://www.markcutz.com';
-
-// ffmpeg settings
-const RESAMPLE_RATE = 11025; // mono PCM rate for peak calc
-const MAX_PIXELS    = 16000;
-const MIN_PIXELS    = 1000;
-
-// ---------- APP ----------
+// ---- App / CORS ----
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: "2mb" }));
 
-app.get('/', (_req, res) => res.type('text').send('peaks-service up'));
-app.get('/health', (_req, res) => res.type('text').send('ok'));
+// Health
+app.get("/", (_req, res) => res.type("text").send("peaks-service up"));
+app.get("/health", (_req, res) => res.type("text").send("ok"));
 
-// ---------- helpers ----------
-function reqEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing required env: ${name}`);
-  return v;
+// ---- Small utils ----
+function tmpFile(ext=""){ return path.join(os.tmpdir(), crypto.randomBytes(8).toString("hex") + ext); }
+function slugify(s){ return String(s).trim().toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/(^-|-$)+/g,"") || `mix-${Date.now()}`; }
+
+async function saveStreamTo(destPath, webReadable){
+  const nodeStream = Readable.fromWeb(webReadable);
+  await pipeline(nodeStream, fs.createWriteStream(destPath));
 }
 
-function tmpFile(ext = '') {
-  const id = crypto.randomBytes(8).toString('hex');
-  return path.join(os.tmpdir(), `${id}${ext}`);
-}
+// Tries CDN, then ALT_CDN (if set), then Bunny Storage (authorized GET)
+async function downloadFromBunnyAny(sourceUrl, destPath){
+  const u = new URL(sourceUrl);
+  const wantedPath = u.pathname; // "/Uploads%202025/2025%20Mixes/xxx.mp3"
 
-// Normalize the MP3 source URL coming from Wix/Bunny
-function normalizeSourceUrl(u) {
-  if (!u) return '';
-  let s = String(u).trim();
+  // 1) Try original URL as-is
+  let r = await fetch(sourceUrl).catch(()=>null);
+  if (r?.ok && r.body) { await saveStreamTo(destPath, r.body); return; }
 
-  // Force your player CDN host (case-insensitive variants)
-  s = s.replace(/^https:\/\/MarkcutzMusic\.b-cdn\.net/i, `https://${CDN_HOST}`)
-       .replace(/^https:\/\/markcutzmusic\.b-cdn\.net/i, `https://${CDN_HOST}`);
-
-  // Ensure host is exactly your player host
-  try {
-    const url = new URL(s);
-    url.hostname = CDN_HOST; // e.g. markcutz-mixes.b-cdn.net
-    // Keep the exact path but encode spaces and @ etc.
-    url.pathname = encodeURI(url.pathname);
-    return url.toString();
-  } catch {
-    // fallback: encode spaces
-    return encodeURI(s.replace('https://MarkcutzMusic.b-cdn.net', `https://${CDN_HOST}`));
+  // 2) If host differs from your primary pull zone, try your primary pull zone
+  const cdnUrl = `https://${CDN_HOST}${wantedPath}`;
+  if (new URL(sourceUrl).host.toLowerCase() !== CDN_HOST.toLowerCase()){
+    r = await fetch(cdnUrl).catch(()=>null);
+    if (r?.ok && r.body) { await saveStreamTo(destPath, r.body); return; }
   }
-}
 
-async function downloadToFile(url, destPath) {
-  // Add a Referer header because your Bunny “Allowed referrers” is enabled
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'peaks-service/1.0',
-      'Accept': '*/*',
-      'Referer': ALLOWED_REFERRER
-    }
-  });
-
-  if (!res.ok || !res.body) {
-    throw new Error(`Download failed ${res.status} ${res.statusText}`);
+  // 3) Try optional alternate pull zone
+  if (ALT_CDN_HOST){
+    const altUrl = `https://${ALT_CDN_HOST}${wantedPath}`;
+    r = await fetch(altUrl).catch(()=>null);
+    if (r?.ok && r.body) { await saveStreamTo(destPath, r.body); return; }
   }
-  const readable = Readable.fromWeb(res.body);
-  await pipeline(readable, fs.createWriteStream(destPath));
-  return destPath;
+
+  // 4) Final fallback: direct from Bunny Storage (authorized GET)
+  const storageUrl = `https://${BUNNY_STORAGE_HOST}/${BUNNY_STORAGE_NAME}${wantedPath}`;
+  r = await fetch(storageUrl, { headers: { "AccessKey": BUNNY_ACCESS_KEY } }).catch(()=>null);
+  if (r?.ok && r.body) { await saveStreamTo(destPath, r.body); return; }
+
+  const status = r ? `${r.status} ${r.statusText}` : "network error";
+  throw new Error(`Download failed ${status}`);
 }
 
-// Get duration (seconds) by ffprobe
-function ffprobeDuration(filePath) {
+function runAudiowaveform(inputFile, outJsonFile, pixels=4000){
   return new Promise((resolve, reject) => {
     const args = [
-      '-v', 'error',
-      '-show_entries', 'format=duration',
-      '-of', 'default=nw=1:nk=1',
-      filePath
+      "-i", inputFile,
+      "--output-format", "json",
+      "-o", outJsonFile,
+      "--pixels", String(Math.max(1000, Math.min(16000, pixels))),
+      "--bits", "8",
+      "--no-progress",
     ];
-    const proc = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    let out = '', err = '';
-    proc.stdout.on('data', d => (out += d.toString()));
-    proc.stderr.on('data', d => (err += d.toString()));
-    proc.on('error', reject);
-    proc.on('close', code => {
-      if (code !== 0) return reject(new Error(`ffprobe exited ${code}: ${err}`));
-      const dur = parseFloat(out.trim());
-      if (!isFinite(dur) || dur <= 0) return reject(new Error('ffprobe returned invalid duration'));
-      resolve(dur);
-    });
+    const p = spawn("audiowaveform", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    p.stderr.on("data", d => { stderr += d.toString(); });
+    p.on("error", err => reject(new Error(`audiowaveform spawn failed: ${err.message}. Is it installed?`)));
+    p.on("close", code => code === 0 ? resolve(outJsonFile) : reject(new Error(`audiowaveform exited ${code}: ${stderr.trim()}`)));
   });
 }
 
-// Stream PCM from ffmpeg and compute peaks
-async function computePeaksWithFfmpeg(inputFile, outPeaksJsonPath, pixels) {
-  // 1) Determine duration to set a fixed bin size
-  const durationSec = await ffprobeDuration(inputFile);
-  const totalSamples = Math.max(1, Math.floor(RESAMPLE_RATE * durationSec));
-  const bins = Math.max(MIN_PIXELS, Math.min(MAX_PIXELS, pixels || 4000));
-  const samplesPerBin = Math.max(1, Math.floor(totalSamples / bins));
-
-  // 2) Spawn ffmpeg to produce 16-bit mono PCM at RESAMPLE_RATE to stdout
-  const args = [
-    '-hide_banner',
-    '-nostdin',
-    '-i', inputFile,
-    '-ac', '1',
-    '-ar', String(RESAMPLE_RATE),
-    '-f', 's16le',
-    'pipe:1'
-  ];
-  const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  let stderr = '';
-  ff.stderr.on('data', d => (stderr += d.toString()));
-
-  const peaks = [];
-  let binMax = 0;
-  let samplesInBin = 0;
-  let leftover = Buffer.alloc(0);
-
-  await new Promise((resolve, reject) => {
-    ff.on('error', (e) => reject(new Error(`ffmpeg spawn failed: ${e.message}`)));
-
-    ff.stdout.on('data', chunk => {
-      // Prepend any leftover bytes to make full samples
-      let buf = leftover.length ? Buffer.concat([leftover, chunk]) : chunk;
-
-      // 2 bytes per sample (signed 16-bit little endian)
-      const usable = buf.length - (buf.length % 2); // drop last odd byte
-      leftover = buf.subarray(usable);              // carry for next chunk
-
-      for (let i = 0; i < usable; i += 2) {
-        // signed int16
-        const sample = buf.readInt16LE(i);
-        const abs = Math.abs(sample);
-        if (abs > binMax) binMax = abs;
-        samplesInBin++;
-
-        if (samplesInBin >= samplesPerBin) {
-          // normalize to [-1..1], positive side only for mirrored display
-          peaks.push(Math.min(1, binMax / 32767));
-          binMax = 0;
-          samplesInBin = 0;
-        }
-      }
-    });
-
-    ff.stdout.on('end', () => {
-      // flush last bin
-      if (samplesInBin > 0) {
-        peaks.push(Math.min(1, binMax / 32767));
-      }
-      resolve();
-    });
-
-    ff.on('close', code => {
-      if (code !== 0) {
-        reject(new Error(`ffmpeg exited ${code}: ${stderr.trim()}`));
-      }
-    });
+// convert 8-bit JSON -> normalized [-1..1] array
+async function toPeaks(rawJsonPath, outPeaksPath){
+  const raw = JSON.parse(await fsp.readFile(rawJsonPath, "utf8"));
+  const data = raw.data || raw.samples || [];
+  const peaks = Array.from(data, (v) => {
+    const n = Number(v); const c = Math.max(0, Math.min(255, isFinite(n) ? n : 128));
+    return (c - 128) / 128;
   });
-
-  // If we ended up with a few more/less than desired bins (rounding), resample length
-  if (peaks.length !== bins && peaks.length > 0) {
-    const normalized = new Array(bins);
-    for (let i = 0; i < bins; i++) {
-      const idx = Math.floor((i / bins) * peaks.length);
-      normalized[i] = peaks[Math.min(idx, peaks.length - 1)];
-    }
-    await fsp.writeFile(outPeaksJsonPath, JSON.stringify(normalized));
-    return { count: normalized.length };
-  }
-
-  await fsp.writeFile(outPeaksJsonPath, JSON.stringify(peaks));
-  return { count: peaks.length };
+  await fsp.writeFile(outPeaksPath, JSON.stringify(peaks));
+  return outPeaksPath;
 }
 
-// Upload a Buffer to Bunny Storage using HTTP API (AccessKey)
-async function uploadToBunnyStorage(filename, buffer, contentType = 'application/json') {
-  const zone = reqEnv('BUNNY_STORAGE_NAME');
-  const url  = `https://${BUNNY_STORAGE_HOST}/${zone}/${BUNNY_FOLDER}/${filename}`;
-
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'AccessKey': reqEnv('BUNNY_ACCESS_KEY'),
-      'Content-Type': contentType
-    },
+async function uploadToBunny(filename, buffer, contentType="application/json"){
+  const url = `https://${BUNNY_STORAGE_HOST}/${BUNNY_STORAGE_NAME}/${BUNNY_FOLDER}/${filename}`;
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: { "AccessKey": BUNNY_ACCESS_KEY, "Content-Type": contentType },
     body: buffer
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Bunny upload failed ${res.status}: ${text}`);
+  if (!r.ok){
+    const t = await r.text().catch(()=> "");
+    throw new Error(`Bunny upload failed ${r.status}: ${t}`);
   }
-
-  // Public CDN URL
-  const cdn = reqEnv('CDN_HOST');
-  return `https://${cdn}/${BUNNY_FOLDER}/${filename}`;
+  return `https://${CDN_HOST}/${BUNNY_FOLDER}/${filename}`;
 }
 
-// ---------- Routes ----------
-/**
- * POST /peaks
- * body: { sourceUrl: string, outName?: string, pixels?: number }
- * returns: { ok: true, cdnUrl, count, ms }
- */
-app.post('/peaks', async (req, res) => {
-  const t0 = Date.now();
-  let tmpIn, tmpPeaks;
+function refAllowed(req){
+  if (!ALLOWED_REFERRER) return true; // no restriction
+  const ref = req.get("referer") || req.get("origin") || "";
+  if (!ref) return true; // allow server-to-server / curl
+  try{
+    const host = new URL(ref).hostname.toLowerCase();
+    return host === ALLOWED_REFERRER;
+  }catch{ return true; }
+}
 
-  try {
-    reqEnv('BUNNY_STORAGE_NAME');
-    reqEnv('BUNNY_ACCESS_KEY');
-    reqEnv('CDN_HOST');
+// ---- API ----
+app.post("/peaks", async (req, res) => {
+  if (!refAllowed(req)) return res.status(403).json({ error: "Forbidden" });
 
-    const sourceUrlRaw = req.body?.sourceUrl;
-    if (!sourceUrlRaw || typeof sourceUrlRaw !== 'string') {
-      return res.status(400).json({ error: 'Missing body.sourceUrl' });
-    }
+  const { sourceUrl, outName, pixels } = req.body || {};
+  if (!sourceUrl || typeof sourceUrl !== "string"){
+    return res.status(400).json({ error: "Missing body.sourceUrl" });
+  }
 
-    const sourceUrl = normalizeSourceUrl(sourceUrlRaw);
-    const pixels = Number(req.body?.pixels) || 4000;
-    const baseName =
-      (req.body?.outName && String(req.body.outName).trim()) ||
-      path.parse(new URL(sourceUrl).pathname).name ||
-      `mix-${Date.now()}`;
+  let inTmp, rawTmp, peaksTmp;
+  try{
+    inTmp    = tmpFile(".mp3");
+    rawTmp   = tmpFile(".raw.json");
+    peaksTmp = tmpFile(".peaks.json");
 
-    // make a sluggy filename
-    const safeBase = String(baseName)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/(^-|-$)+/g, '') || `mix-${Date.now()}`;
-    const filename = `${safeBase}.peaks.json`;
+    // Download with robust fallback
+    await downloadFromBunnyAny(sourceUrl, inTmp);
 
-    // temp paths
-    tmpIn    = tmpFile('.mp3');
-    tmpPeaks = tmpFile('.peaks.json');
+    // Generate
+    await runAudiowaveform(inTmp, rawTmp, Number(pixels) || 4000);
+    await toPeaks(rawTmp, peaksTmp);
 
-    // 1) download MP3 (with Referer)
-    await downloadToFile(sourceUrl, tmpIn);
+    const base = outName ? slugify(outName) : slugify(path.parse(new URL(sourceUrl).pathname).name);
+    const filename = `${base}.peaks.json`;
+    const buf = await fsp.readFile(peaksTmp);
+    const cdnUrl = await uploadToBunny(filename, buf);
 
-    // 2) compute peaks via ffmpeg
-    const { count } = await computePeaksWithFfmpeg(tmpIn, tmpPeaks, pixels);
-
-    // 3) upload to Bunny Storage
-    const buffer = await fsp.readFile(tmpPeaks);
-    const cdnUrl = await uploadToBunnyStorage(filename, buffer, 'application/json');
-
-    const ms = Date.now() - t0;
-    return res.json({ ok: true, cdnUrl, count, ms });
-  } catch (err) {
-    console.error('[peaks] error:', err);
-    return res.status(500).json({ error: String(err?.message || err) });
-  } finally {
-    // cleanup
-    for (const f of [tmpIn, tmpPeaks]) {
-      if (f) fsp.unlink(f).catch(() => {});
-    }
+    res.json({ ok: true, cdnUrl, count: JSON.parse(buf.toString()).length });
+  }catch(err){
+    res.status(500).json({ error: String(err?.message || err) });
+  }finally{
+    for (const f of [inTmp, rawTmp, peaksTmp]) if (f) fsp.unlink(f).catch(()=>{});
   }
 });
 
-// ---------- Start ----------
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`peaks-service listening on :${PORT}`);
-  console.log(`Using Bunny host: ${BUNNY_STORAGE_HOST}`);
 });
