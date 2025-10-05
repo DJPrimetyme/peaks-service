@@ -1,9 +1,6 @@
 // server.js
 // Minimal peaks microservice for Railway + Bunny Storage
-// - Downloads an MP3 from your Bunny CDN (sending a Referer header so hotlink
-//   protection allows it)
-// - Generates a WaveSurfer-compatible peaks JSON using bbc/audiowaveform
-// - Uploads the JSON to Bunny Storage and returns the public CDN URL
+// ESM module (package.json should include: { "type": "module" })
 
 import express from 'express';
 import cors from 'cors';
@@ -19,21 +16,16 @@ import { Readable } from 'node:stream';
 // ---------- ENV ----------
 const PORT = process.env.PORT || 3000;
 
-// Bunny config (required)
 const BUNNY_STORAGE_NAME = process.env.BUNNY_STORAGE_NAME; // e.g. "markcutz"
 const BUNNY_FOLDER       = process.env.BUNNY_FOLDER || 'waveforms';
 const BUNNY_ACCESS_KEY   = process.env.BUNNY_ACCESS_KEY;   // Storage Password
 const CDN_HOST           = process.env.CDN_HOST;           // e.g. "markcutz-mixes.b-cdn.net"
-
-// If your zone is regional, you can override with e.g. 'la.storage.bunnycdn.com'
 const BUNNY_STORAGE_HOST = process.env.BUNNY_STORAGE_HOST || 'storage.bunnycdn.com';
-
-// 👇 NEW: send this Referer header when downloading from the Pull Zone
-const REF = process.env.REFERER_URL || 'https://www.markcutz.com/';
+const DOWNLOAD_REFERER   = process.env.DOWNLOAD_REFERER || 'https://www.markcutz.com/';
 
 // ---------- APP ----------
 const app = express();
-app.use(cors()); // admin page calls from Wix
+app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/', (_req, res) => res.type('text').send('peaks-service up'));
@@ -45,41 +37,61 @@ function reqEnv(name) {
   if (!v) throw new Error(`Missing required env: ${name}`);
   return v;
 }
-
 function tmpFile(ext = '') {
   const id = crypto.randomBytes(8).toString('hex');
   return path.join(os.tmpdir(), `${id}${ext}`);
 }
-
 function slugify(s) {
   return String(s)
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)+/g, '')
-    || `mix-${Date.now()}`;
+    .replace(/(^-|-$)+/g, '') || `mix-${Date.now()}`;
 }
 
-// 👇 UPDATED: include a Referer header so Bunny hotlink protection allows the fetch
+// Decode once if double-encoded (%2520 etc.), then return the string
+function decodeOnce(u) {
+  const s = String(u).trim();
+  if (/%25[0-9A-Fa-f]{2}/.test(s)) {
+    try { return decodeURI(s); } catch {}
+  }
+  return s;
+}
+
+// Normalize path: decode once then encode once
+function singleEncodeUrl(u) {
+  const raw = decodeOnce(u);
+  const url = new URL(raw);
+  try {
+    url.pathname = encodeURI(decodeURI(url.pathname));
+  } catch {
+    url.pathname = encodeURI(url.pathname);
+  }
+  return url.toString();
+}
+
+async function headOk(url) {
+  const r = await fetch(url, {
+    method: 'HEAD',
+    headers: { Referer: DOWNLOAD_REFERER, 'User-Agent': 'peaks-service/1.0' },
+  });
+  return r.ok;
+}
+
 async function downloadToFile(url, destPath) {
   const res = await fetch(url, {
-    headers: {
-      'Referer': REF,
-      'User-Agent': 'peaks-service/1.0 (+railway)'
-    }
+    headers: { Referer: DOWNLOAD_REFERER, 'User-Agent': 'peaks-service/1.0' },
   });
   if (!res.ok || !res.body) {
-    throw new Error(`Download failed ${res.status} ${res.statusText}`);
+    const text = await res.text().catch(() => '');
+    throw new Error(`Download failed ${res.status} ${res.statusText}${text ? ` — ${text.slice(0,120)}` : ''}`);
   }
   const readable = Readable.fromWeb(res.body);
   await pipeline(readable, fs.createWriteStream(destPath));
   return destPath;
 }
 
-/**
- * Run bbc/audiowaveform to create a JSON file with peaks.
- * @returns {Promise<string>} path to raw JSON file produced by audiowaveform
- */
+// Invoke bbc/audiowaveform
 function runAudiowaveform(inputFile, outJsonFile, pixels = 4000) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -94,11 +106,7 @@ function runAudiowaveform(inputFile, outJsonFile, pixels = 4000) {
 
     let stderr = '';
     proc.stderr.on('data', d => { stderr += d.toString(); });
-
-    proc.on('error', (err) =>
-      reject(new Error(`audiowaveform spawn failed: ${err.message}. Is it installed?`))
-    );
-
+    proc.on('error', (err) => reject(new Error(`audiowaveform spawn failed: ${err.message}. Is it installed?`)));
     proc.on('close', (code) => {
       if (code === 0) return resolve(outJsonFile);
       reject(new Error(`audiowaveform exited ${code}: ${stderr.trim()}`));
@@ -106,31 +114,24 @@ function runAudiowaveform(inputFile, outJsonFile, pixels = 4000) {
   });
 }
 
-/**
- * Convert audiowaveform 8-bit JSON -> normalized float array [-1..1]
- * Output is a plain array so WaveSurfer can use it directly.
- */
+// Convert AW 8-bit JSON data -> normalized floats [-1..1]
 async function convertRawJsonToPeaks(rawJsonPath, outPeaksPath) {
   const raw = JSON.parse(await fsp.readFile(rawJsonPath, 'utf8'));
   const data = raw.data || raw.samples || [];
   const peaks = Array.from(data, (v) => {
     const n = Number(v);
     const clamped = Math.max(0, Math.min(255, isFinite(n) ? n : 128));
-    return (clamped - 128) / 128; // -> [-1..~0.99]
+    return (clamped - 128) / 128; // [-1..~0.99]
   });
-
   await fsp.writeFile(outPeaksPath, JSON.stringify(peaks));
   return outPeaksPath;
 }
 
-/**
- * Upload a file Buffer to Bunny Storage using the HTTP API (AccessKey header)
- * Returns the *public CDN URL*.
- */
+// Upload to Bunny Storage via HTTP API (AccessKey)
 async function uploadToBunnyStorage(filename, buffer, contentType = 'application/json') {
-  const zone  = reqEnv('BUNNY_STORAGE_NAME');
-  const host  = BUNNY_STORAGE_HOST;
-  const url   = `https://${host}/${zone}/${BUNNY_FOLDER}/${filename}`;
+  const zone = reqEnv('BUNNY_STORAGE_NAME');
+  const host = BUNNY_STORAGE_HOST; // e.g. storage.bunnycdn.com or la.storage.bunnycdn.com
+  const url  = `https://${host}/${zone}/${BUNNY_FOLDER}/${filename}`;
 
   const res = await fetch(url, {
     method: 'PUT',
@@ -146,39 +147,46 @@ async function uploadToBunnyStorage(filename, buffer, contentType = 'application
     throw new Error(`Bunny upload failed ${res.status}: ${text}`);
   }
 
+  // Return CDN URL for public access
   const cdn = reqEnv('CDN_HOST');
   return `https://${cdn}/${BUNNY_FOLDER}/${filename}`;
 }
 
-// ---------- Routes ----------
+// ---------- Route ----------
 /**
  * POST /peaks
  * body: { sourceUrl: string, outName?: string, pixels?: number }
- * returns: { ok: true, cdnUrl: string, count: number, ms: number }
  */
 app.post('/peaks', async (req, res) => {
   const t0 = Date.now();
   let tmpIn, tmpRaw, tmpPeaks;
 
   try {
-    // Validate envs early
-    reqEnv('BUNNY_STORAGE_NAME');
-    reqEnv('BUNNY_ACCESS_KEY');
-    reqEnv('CDN_HOST');
+    // Ensure envs exist
+    reqEnv('BUNNY_STORAGE_NAME'); reqEnv('BUNNY_ACCESS_KEY'); reqEnv('CDN_HOST');
 
     const { sourceUrl, outName, pixels } = req.body || {};
     if (!sourceUrl || typeof sourceUrl !== 'string') {
       return res.status(400).json({ error: 'Missing body.sourceUrl' });
     }
+
+    // Normalize incoming URL to avoid 404 from double-encoding
+    const normalizedUrl = singleEncodeUrl(sourceUrl);
     const PIXELS = Math.max(1000, Math.min(16000, Number(pixels) || 4000));
 
-    // Temp files
+    // Optional HEAD probe (clearer error than a stream failure)
+    const ok = await headOk(normalizedUrl);
+    if (!ok) {
+      return res.status(404).json({ error: 'Download failed 404 Not Found' });
+    }
+
+    // Prepare temp files
     tmpIn    = tmpFile('.mp3');
     tmpRaw   = tmpFile('.raw.json');
     tmpPeaks = tmpFile('.peaks.json');
 
-    // 1) Download MP3 (with Referer header)
-    await downloadToFile(sourceUrl, tmpIn);
+    // 1) Download MP3
+    await downloadToFile(normalizedUrl, tmpIn);
 
     // 2) Generate raw waveform JSON
     await runAudiowaveform(tmpIn, tmpRaw, PIXELS);
@@ -186,8 +194,8 @@ app.post('/peaks', async (req, res) => {
     // 3) Convert to normalized peaks array
     await convertRawJsonToPeaks(tmpRaw, tmpPeaks);
 
-    // 4) Upload peaks JSON to Bunny
-    const base = outName ? slugify(outName) : slugify(path.parse(sourceUrl).name);
+    // 4) Upload to Bunny
+    const base = outName ? slugify(outName) : slugify(path.parse(new URL(normalizedUrl).pathname).name);
     const filename = `${base}.peaks.json`;
     const buffer   = await fsp.readFile(tmpPeaks);
     const cdnUrl   = await uploadToBunnyStorage(filename, buffer, 'application/json');
@@ -210,5 +218,4 @@ app.post('/peaks', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`peaks-service listening on :${PORT}`);
   console.log(`Using Bunny host: ${BUNNY_STORAGE_HOST}`);
-  console.log(`Download Referer: ${REF}`);
 });
