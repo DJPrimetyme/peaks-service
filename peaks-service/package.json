@@ -1,7 +1,6 @@
 {
   "name": "peaks-service",
   "version": "1.0.0",
-  "description": "Generate WaveSurfer-compatible peaks with ffmpeg and upload to Bunny Storage",
   "type": "module",
   "main": "server.js",
   "scripts": {
