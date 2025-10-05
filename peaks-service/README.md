@@ -4,9 +4,9 @@ A tiny service that turns an MP3 URL into a WaveSurfer-compatible peaks JSON,
 and uploads that JSON straight to Bunny Storage (no Transloadit, no SFTP).
 
 ## Files
-- `server.js` — Express server with `/peaks` endpoint (uses ffmpeg under the hood)
-- `package.json` — Node dependencies
-- `Dockerfile` — Container with Node + ffmpeg
+- `peaks-service/server.js` — Express server with `/peaks` endpoint (uses ffmpeg under the hood)
+- `peaks-service/package.json` — Node dependencies
+- `peaks-service/Dockerfile` — Container with Node + ffmpeg
 
 ## Run locally (needs ffmpeg installed)
 ```bash
